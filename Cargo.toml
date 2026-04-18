@@ -1,0 +1,26 @@
+[package]
+name = "mdtoview"
+version = "0.1.0"
+edition = "2021"
+description = "A live Markdown preview desktop app — paste MD on the left, see rendered output on the right."
+authors = []
+
+[[bin]]
+name = "mdtoview"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.29", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
+egui = "0.29"
+egui_commonmark = { version = "0.18", features = ["pulldown_cmark", "better_syntax_highlighting"] }
+ureq            = { version = "2", features = ["json"] }
+serde           = { version = "1", features = ["derive"] }
+serde_json      = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

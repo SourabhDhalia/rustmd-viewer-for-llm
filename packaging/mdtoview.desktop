@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=mdToView
+GenericName=Markdown Editor
+Comment=AI-powered live Markdown preview
+Exec=mdtoview %F
+Icon=mdtoview
+Terminal=false
+Type=Application
+Categories=Utility;TextEditor;
+MimeType=text/markdown;text/x-markdown;
+StartupNotify=true

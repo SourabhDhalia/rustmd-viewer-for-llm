@@ -1,0 +1,27 @@
+# Rust
+/target/
+
+# Tizen / packaging build outputs
+*.rpm
+*.tpk
+*.wgt
+build/
+out/
+dist/
+
+# Local configs / caches
+.cargo/
+.claude/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Temp files
+*.tmp
+*.swp
