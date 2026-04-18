@@ -9,12 +9,12 @@ build/
 out/
 dist/
 
-# Local configs / caches
-.cargo/
+# Local caches only (NOT .cargo/config.toml — needed for vendor redirect)
 .claude/
 
-# VS Code
-.vscode/
+# VS Code user settings (keep extensions.json)
+.vscode/settings.json
+.vscode/launch.json
 
 # macOS
 .DS_Store
