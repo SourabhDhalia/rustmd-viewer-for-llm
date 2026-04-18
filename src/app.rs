@@ -1,4 +1,5 @@
-use crate::llm::LlmState;
+use crate::llm::{AttachedImage, LlmState};
+use crate::llm::client::encode_image;
 use crate::mdformator::MdFormator;
 use crate::ui::{editor, llm_panel, preview};
 
@@ -22,13 +23,33 @@ impl Default for MdViewApp {
 
 impl eframe::App for MdViewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ── Drag-and-drop file loading ─────────────────────────────────────
+        // ── Drag-and-drop: .md files → editor, images → AI panel ─────────────
         ctx.input(|i| {
             for file in &i.raw.dropped_files {
                 if let Some(path) = &file.path {
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        self.input = content;
-                        self.formator = MdFormator::new();
+                    let ext = path.extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+
+                    if matches!(ext.as_str(), "md" | "markdown" | "txt") {
+                        if let Ok(content) = std::fs::read_to_string(path) {
+                            self.input = content;
+                            self.formator = MdFormator::new();
+                        }
+                    } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+                        if let Ok(bytes) = std::fs::read(path) {
+                            let (media_type, b64) = encode_image(&bytes);
+                            let filename = path.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("image")
+                                .to_string();
+                            self.llm.image = Some(AttachedImage {
+                                media_type,
+                                base64: b64,
+                                filename,
+                            });
+                        }
                     }
                 }
             }

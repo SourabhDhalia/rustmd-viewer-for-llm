@@ -1,6 +1,9 @@
+pub mod capabilities;
 pub mod client;
 
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use capabilities::ModelCapabilities;
 
 // ── Provider ──────────────────────────────────────────────────────────────────
 
@@ -74,7 +77,6 @@ impl LlmAction {
         }
     }
 
-    /// Whether the response should offer to replace the editor content.
     pub fn replaces_editor(&self) -> bool {
         !matches!(self, Self::Ask)
     }
@@ -111,38 +113,107 @@ impl LlmAction {
     }
 }
 
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── Attached image ────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct AttachedImage {
+    pub media_type: String,   // "image/png", "image/jpeg", etc.
+    pub base64:     String,   // standard base64-encoded bytes
+    pub filename:   String,   // display name only
+}
+
+// ── Call parameters passed to the background thread ──────────────────────────
+
+#[derive(Clone)]
+pub struct CallParams {
+    pub provider:          LlmProvider,
+    pub api_key:           String,
+    pub model:             String,
+    pub base_url:          String,
+    pub prompt:            String,
+    pub system_prompt:     Option<String>,
+    pub thinking_enabled:  bool,
+    pub thinking_budget:   u32,
+    pub image:             Option<AttachedImage>,
+    pub temperature:       Option<f32>,
+    pub max_tokens:        u32,
+    pub json_mode:         bool,
+    pub top_p:             Option<f32>,
+}
+
+// ── Status ────────────────────────────────────────────────────────────────────
 
 pub enum LlmStatus {
     Idle,
     Loading,
-    Response { text: String, action: LlmAction },
+    Response { text: String, thinking: Option<String>, action: LlmAction },
     Error(String),
 }
 
+// ── State ─────────────────────────────────────────────────────────────────────
+
 pub struct LlmState {
+    // Connection
     pub provider: LlmProvider,
     pub api_key:  String,
     pub model:    String,
     pub base_url: String,
+
+    // Prompt
     pub prompt:   String,
-    pub status:   LlmStatus,
+
+    // Capabilities (auto-detected, shown in UI)
+    pub caps:     ModelCapabilities,
+
+    // Capability settings (user-controlled)
+    pub thinking_enabled:      bool,
+    pub thinking_budget:       u32,
+    pub image:                 Option<AttachedImage>,
+    pub system_prompt:         String,
+    pub system_prompt_enabled: bool,
+    pub temperature:           f32,
+    pub temperature_enabled:   bool,
+    pub max_tokens:            u32,
+    pub top_p:                 f32,
+    pub top_p_enabled:         bool,
+    pub json_mode:             bool,
+
+    // UI
     pub visible:  bool,
-    rx: Option<Receiver<Result<(String, LlmAction), String>>>,
+    pub status:   LlmStatus,
+    rx:      Option<Receiver<Result<(String, Option<String>, LlmAction), String>>>,
+    cancel:  Option<Arc<AtomicBool>>,
 }
 
 impl Default for LlmState {
     fn default() -> Self {
         let provider = LlmProvider::Claude;
+        let model    = provider.default_model().to_string();
+        let caps     = ModelCapabilities::detect(&provider, &model);
         Self {
-            model:    provider.default_model().to_string(),
             base_url: provider.default_base_url().to_string(),
             provider,
             api_key:  String::new(),
+            model,
+            caps,
             prompt:   String::new(),
-            status:   LlmStatus::Idle,
+
+            thinking_enabled:      false,
+            thinking_budget:       8000,
+            image:                 None,
+            system_prompt:         String::new(),
+            system_prompt_enabled: false,
+            temperature:           0.7,
+            temperature_enabled:   false,
+            max_tokens:            4096,
+            top_p:                 0.95,
+            top_p_enabled:         false,
+            json_mode:             false,
+
             visible:  false,
+            status:   LlmStatus::Idle,
             rx:       None,
+            cancel:   None,
         }
     }
 }
@@ -152,34 +223,63 @@ impl LlmState {
         matches!(self.status, LlmStatus::Loading)
     }
 
-    /// Dispatch a request in a background thread.
+    /// Cancel a running request. The background thread will see the flag and
+    /// return early; the response is dropped and status resets to Idle.
+    pub fn cancel(&mut self) {
+        if let Some(flag) = &self.cancel {
+            flag.store(true, Ordering::Relaxed);
+        }
+        self.rx     = None;
+        self.cancel = None;
+        self.status = LlmStatus::Idle;
+    }
+
     pub fn send(&mut self, action: LlmAction, doc_content: &str) {
         let prompt = action.build_prompt(&self.prompt, doc_content);
         self.status = LlmStatus::Loading;
 
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel_flag.clone());
+
         let (tx, rx): (Sender<_>, Receiver<_>) = channel();
         self.rx = Some(rx);
 
-        let provider = self.provider.clone();
-        let api_key  = self.api_key.clone();
-        let model    = self.model.clone();
-        let base_url = self.base_url.clone();
+        let params = CallParams {
+            provider:         self.provider.clone(),
+            api_key:          self.api_key.clone(),
+            model:            self.model.clone(),
+            base_url:         self.base_url.clone(),
+            prompt,
+            system_prompt:    if self.system_prompt_enabled && !self.system_prompt.is_empty() {
+                Some(self.system_prompt.clone())
+            } else {
+                None
+            },
+            thinking_enabled: self.thinking_enabled && self.caps.extended_thinking,
+            thinking_budget:  self.thinking_budget,
+            image:            if self.caps.vision { self.image.clone() } else { None },
+            temperature:      if self.temperature_enabled { Some(self.temperature) } else { None },
+            max_tokens:       self.max_tokens,
+            json_mode:        self.json_mode && self.caps.json_mode,
+            top_p:            if self.top_p_enabled { Some(self.top_p) } else { None },
+        };
 
         std::thread::spawn(move || {
-            let result = client::call(&provider, &api_key, &model, &base_url, &prompt)
-                .map(|text| (text, action));
-            let _ = tx.send(result);
+            if cancel_flag.load(Ordering::Relaxed) { return; }
+            let result = client::call(&params).map(|(text, thinking)| (text, thinking, action));
+            if !cancel_flag.load(Ordering::Relaxed) {
+                let _ = tx.send(result);
+            }
         });
     }
 
-    /// Poll the background thread — call once per frame.
     pub fn poll(&mut self) {
         if let Some(rx) = &self.rx {
             if let Ok(result) = rx.try_recv() {
                 self.rx = None;
                 self.status = match result {
-                    Ok((text, action)) => LlmStatus::Response { text, action },
-                    Err(e)             => LlmStatus::Error(e),
+                    Ok((text, thinking, action)) => LlmStatus::Response { text, thinking, action },
+                    Err(e)                       => LlmStatus::Error(e),
                 };
             }
         }
@@ -188,6 +288,11 @@ impl LlmState {
     pub fn change_provider(&mut self, p: LlmProvider) {
         self.model    = p.default_model().to_string();
         self.base_url = p.default_base_url().to_string();
+        self.caps     = ModelCapabilities::detect(&p, &self.model);
         self.provider = p;
+    }
+
+    pub fn refresh_caps(&mut self) {
+        self.caps = ModelCapabilities::detect(&self.provider, &self.model);
     }
 }
